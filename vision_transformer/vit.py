@@ -5,13 +5,19 @@ Vision Transformer (ViT) - 视觉变换器 完整实现
 作者: Dosovitskiy et al. (Google Brain), 2021
 arXiv: https://arxiv.org/abs/2010.11929
 
+参考实现:
+  - lucidrains/vit-pytorch (25k ⭐): https://github.com/lucidrains/vit-pytorch
+  - labmlai annotated deep learning (66k ⭐): https://github.com/labmlai/annotated_deep_learning_paper_implementations
+  - jeonsworld/ViT-pytorch (2k ⭐): https://github.com/jeonsworld/ViT-pytorch
+  - huggingface/pytorch-image-models timm (36k ⭐): https://github.com/huggingface/pytorch-image-models
+
 架构总览:
   1. 将输入图片切分成固定大小的图像块 (Patch)
   2. 将每个图像块线性投影为嵌入向量 (Patch Embedding)
   3. 在序列开头加入可学习的分类 Token (CLS Token)
   4. 为每个位置加入可学习的位置编码 (Position Embedding)
   5. 通过多层 Transformer Encoder 处理序列
-  6. 取 CLS Token 对应位置的输出，经过分类头得到预测结果
+  6. 取 CLS Token (或序列均值) 经过分类头得到预测结果
 
 数学符号说明:
   N  = 图片批次大小 (batch size)
@@ -23,11 +29,26 @@ arXiv: https://arxiv.org/abs/2010.11929
   D  = 嵌入维度 (embedding dimension / hidden size)
   h  = 多头注意力的头数 (number of heads)
   d  = 每个注意力头的维度 = D / h
+
+与顶级开源实现的对照:
+  ✅ Conv2d 做 Patch Embedding (labmlai, jeonsworld, timm 均如此)
+  ✅ Pre-Norm (先 LayerNorm 再子层): 所有主流实现的共同选择
+  ✅ 合并 QKV 投影 (lucidrains, timm): 比分开的 Q/K/V 更高效
+  ✅ 注意力权重可视化返回 (jeonsworld): 便于理解模型行为
+  ✅ CLS Token 或 Mean Pooling 二选一 (lucidrains): 更灵活
+  ✅ 2 层 MLP 分类头 (labmlai/原论文): 预训练时使用
+  ✅ eps=1e-6 的 LayerNorm (jeonsworld, timm): 数值更稳定
+  ✅ qkv_bias 可选 (timm): 原论文使用 bias
 """
 
-import math          # 数学运算，用于计算注意力缩放因子
-import torch         # PyTorch 深度学习框架核心库
-import torch.nn as nn  # PyTorch 神经网络模块，提供各种网络层
+import math              # 数学运算，用于计算注意力缩放因子
+from typing import Optional, Tuple  # 类型注解工具
+import torch             # PyTorch 深度学习框架核心库
+import torch.nn as nn   # PyTorch 神经网络模块，提供各种网络层
+
+# LayerNorm 的 eps 常量: 防止除零，1e-6 比默认的 1e-5 更稳定
+# 参考: jeonsworld/ViT-pytorch 和 timm 均使用 1e-6
+LAYER_NORM_EPS = 1e-6
 
 
 # ============================================================
@@ -43,9 +64,12 @@ class PatchEmbedding(nn.Module):
       形状为 (N, L, D) 的图像块嵌入序列。
 
     实现方式:
-      使用一个卷积层 (Conv2d) 完成两件事:
+      使用一个卷积层 (Conv2d) 同时完成两件事:
         1. 将图像切分为不重叠的图像块 (kernel_size=patch_size, stride=patch_size)
         2. 将每个图像块线性投影到 D 维嵌入空间 (out_channels=embed_dim)
+
+      等价于: 将每个 (C × P × P) 的图像块展平后乘以权重矩阵
+      优势: 用卷积比手动展平再矩阵乘法更高效 (labmlai 有详细解释)
 
     参数:
       image_size  (int): 输入图像的边长 (假设图像为正方形)，例如 224
@@ -70,10 +94,10 @@ class PatchEmbedding(nn.Module):
         self.num_patches = (image_size // patch_size) ** 2
 
         # 定义投影卷积层:
-        #   in_channels  = 输入图像通道数 (如 RGB=3)
-        #   embed_dim    = 输出通道数，即嵌入维度 D
-        #   kernel_size  = patch_size：每个卷积核恰好覆盖一个图像块
-        #   stride       = patch_size：步长等于块大小，确保不重叠切分
+        #   in_channels = 输入图像通道数 (如 RGB=3)
+        #   embed_dim   = 输出通道数，即嵌入维度 D
+        #   kernel_size = patch_size：每个卷积核恰好覆盖一个图像块
+        #   stride      = patch_size：步长等于块大小，确保不重叠切分
         # 效果: 将 (N, C, H, W) → (N, D, H/P, W/P)
         self.projection = nn.Conv2d(
             in_channels=in_channels,
@@ -96,18 +120,18 @@ class PatchEmbedding(nn.Module):
                 L = num_patches (图像块数量)
                 D = embed_dim (嵌入维度)
         """
-        # 步骤1: 卷积投影
+        # 步骤1: 卷积投影，将每个图像块映射到 D 维向量
         # x: (N, C, H, W) → (N, D, H/P, W/P)
         x = self.projection(x)
 
         # 步骤2: 将空间维度展平
         # (N, D, H/P, W/P) → (N, D, L)   其中 L = (H/P)*(W/P)
-        # flatten(2) 表示从第2个维度开始展平
+        # flatten(2) 表示从第2个维度开始展平所有后续维度
         x = x.flatten(2)
 
         # 步骤3: 调换维度，使序列长度在第1维
         # (N, D, L) → (N, L, D)
-        # transpose(1, 2) 交换第1维和第2维
+        # transpose(1, 2) 交换第1维和第2维，符合 Transformer 的输入格式
         x = x.transpose(1, 2)
 
         return x  # 返回形状 (N, L, D) 的图像块嵌入序列
@@ -134,13 +158,26 @@ class MultiHeadSelfAttention(nn.Module):
       再将所有头的输出拼接后通过线性变换得到最终输出。
       好处：让模型能从不同的"角度"关注不同的信息。
 
+    参考实现对比:
+      - lucidrains: 使用合并 QKV 投影 + chunk 分割，更简洁
+      - jeonsworld: 使用分开的 Q/K/V 投影，更接近论文描述，并可返回注意力权重
+      - timm: 提供 qkv_bias 选项，原始 ViT 论文默认使用 bias
+      本实现: 合并 QKV 投影 + 支持 bias + 可返回注意力权重 (综合上述优点)
+
     参数:
       embed_dim   (int): 嵌入维度 D
       num_heads   (int): 注意力头数 h，需满足 D % h == 0
+      qkv_bias    (bool): 是否在 QKV 投影中使用偏置，原始论文为 True
       dropout     (float): Dropout 比率，用于防止过拟合
     """
 
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        qkv_bias: bool = True,
+        dropout: float = 0.0,
+    ):
         super().__init__()
 
         # 确保嵌入维度可以被头数整除
@@ -152,18 +189,21 @@ class MultiHeadSelfAttention(nn.Module):
         self.num_heads = num_heads   # 注意力头数 h
 
         # 每个注意力头的维度: d = D / h
-        # 例如: D=768, h=12 → d=64
+        # 例如: D=768, h=12 → d=64 (ViT-Base 的标准配置)
         self.head_dim = embed_dim // num_heads
 
         # 注意力缩放因子: 1 / √d
-        # 缩放的目的：防止点积结果过大导致 softmax 进入梯度极小的饱和区
+        # 缩放的目的: 防止点积结果过大导致 softmax 进入梯度极小的饱和区
+        # 参考: Vaswani et al. "Attention is All You Need" (2017)
         self.scale = self.head_dim ** -0.5
 
-        # QKV 投影矩阵 (一次性计算 Q、K、V 三个矩阵，效率更高)
+        # QKV 合并投影矩阵 (lucidrains 风格，比分开的 Q/K/V 更高效)
+        # 一次性计算 Q、K、V 三个矩阵
         # 输入维度: D，输出维度: 3*D (Q、K、V 各占 D 维)
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        # qkv_bias: 原始 ViT 论文在 Q/K/V 投影中使用偏置项
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=qkv_bias)
 
-        # 输出投影矩阵: 将多头注意力的输出映射回 D 维
+        # 输出投影矩阵: 将多头注意力的拼接输出映射回 D 维
         self.proj = nn.Linear(embed_dim, embed_dim)
 
         # Dropout 层，在注意力权重上应用，防止过拟合
@@ -172,67 +212,86 @@ class MultiHeadSelfAttention(nn.Module):
         # Dropout 层，在输出投影后应用
         self.proj_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_attn_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         前向传播
 
-        输入:  x 形状为 (N, L+1, D)
-                N   = batch_size
-                L+1 = 序列长度 (图像块数量 + 1个CLS token)
-                D   = embed_dim
+        输入:
+          x                  形状 (N, S, D)
+                               N   = batch_size
+                               S   = 序列长度 (图像块数量 + 1个CLS token)
+                               D   = embed_dim
+          return_attn_weights 是否返回注意力权重矩阵 (用于可视化)
 
-        输出: 形状为 (N, L+1, D)，与输入形状相同
+        输出:
+          out    形状 (N, S, D)，与输入形状相同
+          attn   若 return_attn_weights=True，返回形状 (N, h, S, S) 的注意力矩阵
+                 若 return_attn_weights=False，返回 None
         """
         N, S, D = x.shape  # 获取 batch size N，序列长度 S，嵌入维度 D
 
-        # 步骤1: 计算 Q、K、V
+        # ---- 步骤1: 合并计算 Q、K、V ----
         # x: (N, S, D) → qkv: (N, S, 3*D)
         qkv = self.qkv(x)
 
-        # 步骤2: 重塑维度，分离出 Q、K、V 并划分多头
-        # (N, S, 3*D)
-        # → reshape → (N, S, 3, h, d)  按头分割
-        # → permute → (3, N, h, S, d)  调整维度顺序便于后续操作
+        # ---- 步骤2: 重塑并划分多头 ----
+        # (N, S, 3*D) → reshape → (N, S, 3, h, d)
+        # 其中 h = num_heads，d = head_dim，3 对应 Q/K/V
         qkv = qkv.reshape(N, S, 3, self.num_heads, self.head_dim)
+
+        # → permute → (3, N, h, S, d)  调整维度顺序便于后续操作
         qkv = qkv.permute(2, 0, 3, 1, 4)
 
         # 从 qkv 中分离出 Q、K、V，每个形状均为 (N, h, S, d)
-        q, k, v = qkv.unbind(0)  # unbind(0) 在第0维上分解张量
+        # unbind(0) 在第0维上分解张量，等价于 chunk(3, dim=0) 后解包
+        q, k, v = qkv.unbind(0)
 
-        # 步骤3: 计算注意力分数 (scaled dot-product attention)
+        # ---- 步骤3: 计算缩放点积注意力分数 ----
         # Q: (N, h, S, d)  K^T: (N, h, d, S)
-        # 矩阵乘法结果: (N, h, S, S)
-        # 每个元素 attn[n,h,i,j] 表示第 i 个 token 对第 j 个 token 的注意力分数
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # 乘以缩放因子
+        # @ 是矩阵乘法操作符，结果: (N, h, S, S)
+        # attn[n, head, i, j] = token_i 对 token_j 的注意力得分 (归一化前)
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # 乘以缩放因子 1/√d
 
-        # 步骤4: 归一化注意力权重
-        # 对最后一维 (即所有 token) 做 softmax，使权重之和为 1
-        # (N, h, S, S) → (N, h, S, S)  (形状不变，但值变为概率分布)
+        # ---- 步骤4: Softmax 归一化 ----
+        # 对最后一维 (所有 key 位置) 做 softmax，使注意力权重之和为 1
+        # (N, h, S, S) → (N, h, S, S)，形状不变但值变为概率分布
         attn = attn.softmax(dim=-1)
 
-        # 步骤5: 对注意力权重应用 Dropout (训练时随机丢弃部分注意力连接)
+        # ---- 步骤5: 在注意力权重上应用 Dropout ----
+        # 训练时随机丢弃部分注意力连接，防止过拟合
+        # 参考 jeonsworld：在 attention_probs 上 dropout 后再与 V 相乘
+        attn_weights = attn  # 保存用于可视化的注意力权重 (Dropout 前)
         attn = self.attn_dropout(attn)
 
-        # 步骤6: 用注意力权重对值 V 进行加权聚合
+        # ---- 步骤6: 加权聚合值向量 V ----
         # attn: (N, h, S, S)  v: (N, h, S, d)
-        # 结果: (N, h, S, d)
+        # 结果: (N, h, S, d)  每个位置的输出是所有位置值向量的加权和
         x = attn @ v
 
-        # 步骤7: 重新合并所有注意力头
-        # (N, h, S, d) → transpose → (N, S, h, d)
+        # ---- 步骤7: 合并所有注意力头 ----
+        # (N, h, S, d) → transpose(1,2) → (N, S, h, d)
         x = x.transpose(1, 2)
         # (N, S, h, d) → reshape → (N, S, h*d) = (N, S, D)
-        # contiguous() 确保内存连续，reshape 操作需要
+        # contiguous() 确保内存连续，这是 reshape 操作的前提
         x = x.contiguous().reshape(N, S, D)
 
-        # 步骤8: 输出投影，将合并后的多头输出映射回 D 维
+        # ---- 步骤8: 输出投影 ----
+        # 将合并后的多头输出映射回 D 维嵌入空间
         # (N, S, D) → (N, S, D)
         x = self.proj(x)
 
-        # 步骤9: 在输出上应用 Dropout
+        # ---- 步骤9: 输出 Dropout ----
         x = self.proj_dropout(x)
 
-        return x  # 形状: (N, S, D)
+        # 返回输出和注意力权重 (后者用于可视化)
+        # 参考 jeonsworld：forward 返回 (output, weights) 元组
+        if return_attn_weights:
+            return x, attn_weights   # attn_weights 形状: (N, h, S, S)
+        return x, None  # 不需要可视化时不占用额外内存
 
 
 # ============================================================
@@ -247,12 +306,13 @@ class FeedForward(nn.Module):
       Linear(D → hidden_dim) → GELU激活 → Dropout → Linear(hidden_dim → D) → Dropout
 
     在 ViT 中, hidden_dim 通常是 embed_dim 的 4 倍。
-    GELU (Gaussian Error Linear Unit) 是一种平滑的非线性激活函数，
-    在 Transformer 中比 ReLU 表现更好。
+    GELU (Gaussian Error Linear Unit) 是一种平滑的非线性激活函数:
+      GELU(x) = x × Φ(x)，其中 Φ 是标准正态分布的累积分布函数
+      在 Transformer 架构中比 ReLU 表现更好 (所有主流 ViT 实现均使用 GELU)
 
     参数:
       embed_dim   (int): 输入/输出维度 D
-      hidden_dim  (int): 隐藏层维度，通常为 4*D
+      hidden_dim  (int): 隐藏层维度，通常为 4*D (约 3072 for ViT-Base)
       dropout     (float): Dropout 比率
     """
 
@@ -262,16 +322,17 @@ class FeedForward(nn.Module):
         # 定义 MLP 的各个层，Sequential 将它们串联起来
         self.net = nn.Sequential(
             # 第一个线性层：扩展维度 D → hidden_dim (通常为 4*D)
+            # 较宽的隐藏层让网络能学习更丰富的特征变换
             nn.Linear(embed_dim, hidden_dim),
 
             # GELU 激活函数：引入非线性，使网络能学习复杂特征
-            # GELU(x) = x * Φ(x)，其中 Φ 是正态分布的累积分布函数
+            # GELU(x) = x × Φ(x)，Φ 是标准正态分布的累积分布函数
             nn.GELU(),
 
             # Dropout：随机将部分神经元输出置零，防止过拟合
             nn.Dropout(dropout),
 
-            # 第二个线性层：压缩维度 hidden_dim → D
+            # 第二个线性层：压缩维度 hidden_dim → D (还原到嵌入维度)
             nn.Linear(hidden_dim, embed_dim),
 
             # 再次应用 Dropout
@@ -283,7 +344,7 @@ class FeedForward(nn.Module):
         前向传播
 
         输入:  x 形状为 (N, S, D)
-        输出: 形状为 (N, S, D)，形状不变
+        输出: 形状为 (N, S, D)，形状不变，但每个 token 的内容经过非线性变换
         """
         return self.net(x)  # 顺序通过 Sequential 中的所有层
 
@@ -296,23 +357,30 @@ class TransformerEncoderBlock(nn.Module):
     """
     Transformer 编码器块 (Transformer Encoder Block)
     -------------------------------------------------
-    结构 (Pre-LayerNorm 变体，实践中更稳定):
+    结构 (Pre-LayerNorm 变体，所有主流实现的共同选择):
       x = x + MHSA(LayerNorm(x))    ← 残差连接 + 多头自注意力
       x = x + FFN(LayerNorm(x))     ← 残差连接 + 前馈神经网络
 
+    为什么用 Pre-Norm (先 LayerNorm 再子层)?
+      原始 Transformer 论文用的是 Post-Norm (先子层再 LayerNorm)。
+      但实验发现 Pre-Norm 训练更稳定、收敛更快，
+      现代 ViT 实现 (lucidrains, timm, jeonsworld) 均默认使用 Pre-Norm。
+
     残差连接 (Residual Connection):
       将输入直接加到子层输出上: output = x + sublayer(x)
-      好处: 解决深层网络的梯度消失问题，允许梯度直接流过网络
+      好处: 解决深层网络的梯度消失问题，允许梯度直接流过网络 (恒等映射)
 
     层归一化 (Layer Normalization):
       对每个样本的特征维度做归一化，稳定训练过程
       与 BatchNorm 不同，LayerNorm 对每个 token 的 D 维向量独立归一化
+      eps=1e-6 (比默认 1e-5 更稳定，参考 jeonsworld 和 timm)
 
     参数:
-      embed_dim   (int): 嵌入维度 D
-      num_heads   (int): 注意力头数
-      mlp_ratio   (float): FFN 隐藏层维度与 embed_dim 的比值，通常为 4.0
-      dropout     (float): Dropout 比率
+      embed_dim         (int): 嵌入维度 D
+      num_heads         (int): 注意力头数
+      mlp_ratio         (float): FFN 隐藏层维度与 embed_dim 的比值，通常为 4.0
+      qkv_bias          (bool): QKV 投影是否使用偏置
+      dropout           (float): Dropout 比率
     """
 
     def __init__(
@@ -320,22 +388,25 @@ class TransformerEncoderBlock(nn.Module):
         embed_dim: int,
         num_heads: int,
         mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
         dropout: float = 0.0,
     ):
         super().__init__()
 
         # 第一个层归一化，在自注意力前应用 (Pre-Norm)
-        self.norm1 = nn.LayerNorm(embed_dim)
+        # eps=1e-6 参考 jeonsworld 的实现，比默认 eps=1e-5 更数值稳定
+        self.norm1 = nn.LayerNorm(embed_dim, eps=LAYER_NORM_EPS)
 
         # 多头自注意力层
         self.attention = MultiHeadSelfAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
+            qkv_bias=qkv_bias,
             dropout=dropout,
         )
 
         # 第二个层归一化，在前馈网络前应用 (Pre-Norm)
-        self.norm2 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim, eps=LAYER_NORM_EPS)
 
         # 前馈神经网络
         # 隐藏维度 = embed_dim * mlp_ratio (例如 768 * 4 = 3072)
@@ -345,26 +416,96 @@ class TransformerEncoderBlock(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_attn_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         前向传播
 
-        输入:  x 形状为 (N, S, D)
-        输出: 形状为 (N, S, D)，形状不变
+        输入:
+          x                  形状 (N, S, D)
+          return_attn_weights 是否返回注意力权重 (用于可视化)
+
+        输出:
+          x     形状 (N, S, D)，形状不变
+          attn  注意力权重 (N, h, S, S) 或 None
         """
-        # 分支1: 自注意力 + 残差连接
-        # 先对 x 做 LayerNorm，再通过 MHSA，最后加上原始 x (残差)
-        x = x + self.attention(self.norm1(x))
+        # 分支1: LayerNorm → 自注意力 → 残差连接
+        # 先 LayerNorm，再通过 MHSA，最后加上原始 x (残差)
+        attn_out, attn_weights = self.attention(
+            self.norm1(x),
+            return_attn_weights=return_attn_weights,
+        )
+        x = x + attn_out  # 残差连接
 
-        # 分支2: 前馈网络 + 残差连接
-        # 先对 x 做 LayerNorm，再通过 FFN，最后加上原始 x (残差)
-        x = x + self.feed_forward(self.norm2(x))
+        # 分支2: LayerNorm → 前馈网络 → 残差连接
+        # 先 LayerNorm，再通过 FFN，最后加上原始 x (残差)
+        x = x + self.feed_forward(self.norm2(x))  # 残差连接
 
-        return x  # 形状: (N, S, D)
+        return x, attn_weights  # 形状: (N, S, D)
 
 
 # ============================================================
-# 第五部分：完整 Vision Transformer 模型
+# 第五部分：MLP 分类头 (MLP Classification Head)
+# ============================================================
+
+class MLPHead(nn.Module):
+    """
+    MLP 分类头 (两层全连接网络)
+    --------------------------
+    原始 ViT 论文描述:
+      "pre-training时使用一个带一个隐藏层的 MLP 作为分类头，
+       fine-tuning时替换为单层线性层。"
+      隐藏层大小通常等于嵌入维度 D。
+
+    参考: labmlai annotated 实现中的 ClassificationHead (Linear → Act → Linear)
+
+    结构:
+      Linear(D → hidden_dim) → activation → Linear(hidden_dim → num_classes)
+
+    参数:
+      embed_dim   (int): 输入维度 D
+      num_classes (int): 分类数量
+      hidden_dim  (int): 隐藏层维度，默认等于 embed_dim (原论文设置)
+      act_layer: 激活函数类，默认 GELU (tanh 也是原论文选项)
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_classes: int,
+        hidden_dim: Optional[int] = None,
+        act_layer: type = nn.GELU,
+    ):
+        super().__init__()
+
+        # 若未指定隐藏层维度，默认等于嵌入维度 (原论文设置)
+        hidden_dim = hidden_dim or embed_dim
+
+        # 构建两层 MLP: Linear → 激活 → Linear
+        self.net = nn.Sequential(
+            # 第一层：输入维度 D → 隐藏维度
+            nn.Linear(embed_dim, hidden_dim),
+
+            # 激活函数：默认 GELU，与 FFN 保持一致
+            act_layer(),
+
+            # 第二层：隐藏维度 → 分类数
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        输入:  x 形状 (N, D)  — CLS token 或均值池化输出
+        输出: 形状 (N, num_classes) 的分类 logits
+        """
+        return self.net(x)
+
+
+# ============================================================
+# 第六部分：完整 Vision Transformer 模型
 # ============================================================
 
 class VisionTransformer(nn.Module):
@@ -375,25 +516,31 @@ class VisionTransformer(nn.Module):
       输入图像 (N, C, H, W)
         ↓ PatchEmbedding
       图像块序列 (N, L, D)
-        ↓ 拼接 CLS Token → (N, L+1, D)
+        ↓ 拼接 CLS Token → (N, L+1, D)   [仅 pool='cls' 时]
         ↓ 加 Position Embedding → (N, L+1, D)
         ↓ Dropout
-        ↓ N × TransformerEncoderBlock
+        ↓ depth × TransformerEncoderBlock
       编码后序列 (N, L+1, D)
-        ↓ 取 CLS Token 位置 → (N, D)
+        ↓ 池化: CLS Token (x[:,0]) 或 Mean Pooling (x.mean(1))
+      特征向量 (N, D)
         ↓ LayerNorm
-        ↓ 分类头 (Linear)
+        ↓ 分类头 (MLP 或 Linear)
       分类预测 (N, num_classes)
 
     参数:
       image_size    (int): 输入图像边长，默认 224
       patch_size    (int): 图像块边长，默认 16
       in_channels   (int): 输入通道数，默认 3 (RGB)
-      num_classes   (int): 分类数量
+      num_classes   (int): 分类数量，默认 1000 (ImageNet)
       embed_dim     (int): 嵌入维度 D，默认 768
       depth         (int): Transformer Encoder 块的数量，默认 12
       num_heads     (int): 注意力头数，默认 12
       mlp_ratio     (float): FFN 隐藏层比例，默认 4.0
+      qkv_bias      (bool): QKV 投影是否使用偏置，默认 True (原论文)
+      pool          (str): 池化方式，'cls' (CLS Token) 或 'mean' (均值池化)
+                           参考 lucidrains 实现，'mean' 有时效果更好
+      mlp_head      (bool): 是否使用 2 层 MLP 分类头 (原论文预训练设置)
+                           False 则使用单层线性分类头 (fine-tuning 设置)
       dropout       (float): Dropout 比率，默认 0.0
     """
 
@@ -407,9 +554,20 @@ class VisionTransformer(nn.Module):
         depth: int = 12,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        pool: str = "cls",
+        mlp_head: bool = False,
         dropout: float = 0.0,
     ):
         super().__init__()
+
+        # 验证池化方式参数
+        # 参考 lucidrains: assert pool in {'cls', 'mean'}
+        assert pool in {"cls", "mean"}, (
+            f"pool 必须为 'cls' 或 'mean'，当前值: '{pool}'"
+        )
+
+        self.pool = pool  # 保存池化方式
 
         # ------ 1. 图像块嵌入层 ------
         # 将图像切分并投影到 D 维嵌入空间
@@ -426,50 +584,68 @@ class VisionTransformer(nn.Module):
         # ------ 2. 分类 Token (CLS Token) ------
         # 形状为 (1, 1, D) 的可学习参数
         # 在序列开头拼接，充当整幅图像的全局表示
-        # nn.Parameter 将张量注册为可学习参数，会被优化器更新
+        # nn.Parameter 将张量注册为可学习参数，会被优化器自动更新
+        # 注意: 使用 zeros 初始化 (稍后的 _init_weights 会用截断正态分布覆盖)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
         # ------ 3. 位置嵌入 (Position Embedding) ------
         # 形状为 (1, num_patches + 1, D) 的可学习参数
-        # +1 是因为加入了 CLS Token
+        # +1 是因为加入了 CLS Token (如果 pool='mean' 则实际不用 CLS，但保留维度一致)
         # 位置嵌入让模型知道每个 token 在序列中的位置信息
-        # (Transformer 本身是置换不变的，不区分位置，需要位置编码)
+        # 核心原因: Transformer 自注意力本身对位置没有感知 (置换不变性)
         self.position_embedding = nn.Parameter(
             torch.zeros(1, num_patches + 1, embed_dim)
         )
 
         # ------ 4. 嵌入 Dropout ------
-        # 在图像块嵌入 + 位置嵌入后应用 Dropout
+        # 在图像块嵌入 + 位置嵌入后应用 Dropout (emb_dropout)
         self.embed_dropout = nn.Dropout(dropout)
 
         # ------ 5. Transformer 编码器 ------
         # 由 depth 个 TransformerEncoderBlock 串联组成
-        # nn.ModuleList 将多个模块注册为子模块列表
+        # nn.ModuleList 将多个模块注册为子模块列表，确保参数被正确追踪
         self.transformer_blocks = nn.ModuleList([
             TransformerEncoderBlock(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
                 dropout=dropout,
             )
             for _ in range(depth)  # 循环创建 depth 个编码器块
         ])
 
         # ------ 6. 最终层归一化 ------
-        # 在取出 CLS Token 输出后应用，稳定最终特征表示
-        self.norm = nn.LayerNorm(embed_dim)
+        # 在池化前对整个序列做 LayerNorm，稳定最终特征表示
+        # eps=1e-6 参考 jeonsworld 和 timm 的实现
+        self.norm = nn.LayerNorm(embed_dim, eps=LAYER_NORM_EPS)
 
         # ------ 7. 分类头 ------
-        # 将 D 维 CLS Token 特征映射到 num_classes 个类别得分
-        self.head = nn.Linear(embed_dim, num_classes)
+        # mlp_head=True: 使用 2 层 MLP (原论文预训练时的设置，参考 labmlai)
+        # mlp_head=False: 使用单层线性层 (fine-tuning 时的设置)
+        if mlp_head:
+            # 2 层 MLP 头: Linear(D→D) → GELU → Linear(D→num_classes)
+            self.head = MLPHead(
+                embed_dim=embed_dim,
+                num_classes=num_classes,
+            )
+        else:
+            # 单层线性头: Linear(D→num_classes)
+            self.head = nn.Linear(embed_dim, num_classes)
 
         # ------ 8. 权重初始化 ------
         # 对关键参数进行适当初始化，有助于训练稳定性
+        # 参考 jeonsworld 和 timm 的初始化策略
         self._init_weights()
 
     def _init_weights(self):
-        """初始化模型权重"""
+        """
+        初始化模型权重
+        参考: jeonsworld 对 Linear 使用 xavier_uniform_，
+              timm 和 lucidrains 对 cls_token/pos_embedding 使用 trunc_normal_
+        """
         # 用截断正态分布初始化 CLS Token，标准差 0.02 是 ViT 的常用设置
+        # 截断正态分布: 限制在 [-2σ, 2σ] 范围内的正态分布，避免极端值
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
         # 用截断正态分布初始化位置嵌入
@@ -478,7 +654,7 @@ class VisionTransformer(nn.Module):
         # 遍历所有子模块，对线性层和层归一化进行初始化
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                # 线性层权重：截断正态分布初始化
+                # 线性层权重：截断正态分布初始化 (timm 风格)
                 nn.init.trunc_normal_(module.weight, std=0.02)
                 # 线性层偏置：初始化为 0
                 if module.bias is not None:
@@ -486,73 +662,121 @@ class VisionTransformer(nn.Module):
             elif isinstance(module, nn.LayerNorm):
                 # LayerNorm 偏置：初始化为 0
                 nn.init.zeros_(module.bias)
-                # LayerNorm 缩放因子：初始化为 1
+                # LayerNorm 缩放因子 (weight/gamma)：初始化为 1 (不缩放)
                 nn.init.ones_(module.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_attn_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[list]]:
         """
         前向传播
 
-        输入:  x 形状为 (N, C, H, W)
-                N = batch_size, C = 通道数, H/W = 图像尺寸
+        输入:
+          x                  形状 (N, C, H, W)
+                               N = batch_size, C = 通道数, H/W = 图像尺寸
+          return_attn_weights 是否返回所有层的注意力权重 (用于可视化)
 
-        输出: 形状为 (N, num_classes) 的分类预测分数 (logits)
+        输出:
+          logits       形状 (N, num_classes) 的分类预测分数
+          attn_list    若 return_attn_weights=True，返回每层注意力权重的列表
+                       每个元素形状为 (N, h, S, S)；否则返回 None
         """
         N = x.shape[0]  # 获取 batch size
 
-        # ---- 步骤1: 图像块嵌入 ----
+        # ==== 步骤1: 图像块嵌入 ====
         # (N, C, H, W) → (N, L, D)   L = num_patches
         x = self.patch_embedding(x)
 
-        # ---- 步骤2: 拼接 CLS Token ----
+        # ==== 步骤2: 拼接 CLS Token ====
         # cls_token 形状: (1, 1, D)
-        # 通过 expand 扩展到当前 batch 大小: (N, 1, D)
-        # expand 不会复制数据 (节省内存)，只是扩展视图
-        cls_tokens = self.cls_token.expand(N, -1, -1)  # -1 表示该维度不变
+        # expand 扩展到当前 batch: (N, 1, D)
+        # expand 只改变视图 (不复制数据)，内存高效
+        cls_tokens = self.cls_token.expand(N, -1, -1)  # -1 表示该维度保持不变
 
         # 沿序列维度 (dim=1) 拼接 CLS Token 和图像块嵌入
         # (N, 1, D) + (N, L, D) → (N, L+1, D)
+        # CLS Token 放在序列最前面 (index 0)
         x = torch.cat([cls_tokens, x], dim=1)
 
-        # ---- 步骤3: 添加位置嵌入 ----
-        # position_embedding 形状: (1, L+1, D)，会自动广播到 (N, L+1, D)
-        # 直接相加，每个位置的嵌入向量都加上对应位置的位置编码
+        # ==== 步骤3: 添加位置嵌入 ====
+        # position_embedding 形状: (1, L+1, D)
+        # 广播到 (N, L+1, D) 后与 x 相加
+        # 每个位置的 token 向量都加上其对应的位置编码
         x = x + self.position_embedding
 
-        # ---- 步骤4: 嵌入 Dropout ----
+        # ==== 步骤4: 嵌入 Dropout ====
         # 在嵌入层输出后应用 Dropout (仅在训练阶段有效)
         x = self.embed_dropout(x)
 
-        # ---- 步骤5: 逐层通过 Transformer Encoder ----
-        # 循环通过每个 Transformer 编码器块
-        # 每个块的输入和输出形状均为 (N, L+1, D)
-        for block in self.transformer_blocks:
-            x = block(x)  # x: (N, L+1, D) → (N, L+1, D)
+        # ==== 步骤5: 逐层通过 Transformer Encoder ====
+        # 存储每层的注意力权重 (用于可视化)
+        attn_list = [] if return_attn_weights else None
 
-        # ---- 步骤6: 最终层归一化 ----
+        for block in self.transformer_blocks:
+            # 每个块的输入和输出形状均为 (N, L+1, D)
+            x, attn_weights = block(x, return_attn_weights=return_attn_weights)
+            if return_attn_weights:
+                attn_list.append(attn_weights)  # 收集每层的注意力权重
+
+        # ==== 步骤6: 最终层归一化 ====
         # 对整个序列做 LayerNorm，形状不变: (N, L+1, D)
         x = self.norm(x)
 
-        # ---- 步骤7: 提取 CLS Token 对应的输出 ----
-        # CLS Token 位于序列第 0 个位置
-        # x[:, 0, :]: 取所有样本的第 0 个 token → (N, D)
-        cls_output = x[:, 0, :]
+        # ==== 步骤7: 池化，提取全局特征向量 ====
+        if self.pool == "cls":
+            # CLS Token 池化: 取序列第 0 个位置的输出
+            # x[:, 0]: 取所有样本的第 0 个 token → (N, D)
+            # CLS Token 经过多层 Transformer 后应聚合了全图信息
+            x = x[:, 0]
+        else:
+            # Mean Pooling: 对所有图像块 token 求均值
+            # x[:, 1:]: 跳过 CLS Token，只对图像块 token 求均值
+            # → (N, D)
+            # 参考 lucidrains: x.mean(dim=1)
+            x = x[:, 1:].mean(dim=1)  # 均值池化，忽略 CLS Token
 
-        # ---- 步骤8: 分类头 ----
+        # ==== 步骤8: 分类头 ====
         # (N, D) → (N, num_classes)
-        logits = self.head(cls_output)
+        logits = self.head(x)
 
-        return logits  # 形状: (N, num_classes)
+        return logits, attn_list  # logits 形状: (N, num_classes)
+
+    def get_attention_map(self, x: torch.Tensor, layer_idx: int = -1) -> torch.Tensor:
+        """
+        获取指定层的注意力权重图 (用于可视化模型关注的区域)
+        参考 jeonsworld/ViT-pytorch 中的注意力可视化方法
+
+        输入:
+          x         形状 (1, C, H, W)  — 单张图片 (batch_size=1)
+          layer_idx 要可视化的层索引，-1 表示最后一层
+
+        输出:
+          attn_map  形状 (h, S, S) — 该层所有注意力头的权重矩阵
+                    h = 注意力头数，S = 序列长度 (L+1)
+        """
+        self.eval()  # 切换到评估模式
+        with torch.no_grad():
+            _, attn_list = self.forward(x, return_attn_weights=True)
+
+        # 取指定层的注意力权重
+        # attn_list[layer_idx] 形状: (1, h, S, S)
+        # squeeze(0) 去掉 batch 维度 → (h, S, S)
+        attn_map = attn_list[layer_idx].squeeze(0)
+
+        return attn_map  # 形状: (h, S, S)
 
 
 # ============================================================
-# 第六部分：常用 ViT 模型配置工厂函数
+# 第七部分：常用 ViT 模型配置工厂函数
 # ============================================================
 
 def vit_tiny(num_classes: int = 1000, **kwargs) -> VisionTransformer:
     """
-    ViT-Tiny: 最小的 ViT 变体，参数量最少，适合快速实验
+    ViT-Tiny: 最小的 ViT 变体，参数量最少，适合快速实验和教学
     参数量约 5.7M
+    每头维度: 192/3 = 64 (与更大模型保持一致)
     """
     return VisionTransformer(
         image_size=224, patch_size=16, in_channels=3,
@@ -569,6 +793,7 @@ def vit_small(num_classes: int = 1000, **kwargs) -> VisionTransformer:
     """
     ViT-Small: 小型 ViT，参数量和精度的较好平衡
     参数量约 22M
+    每头维度: 384/6 = 64
     """
     return VisionTransformer(
         image_size=224, patch_size=16, in_channels=3,
@@ -585,6 +810,7 @@ def vit_base(num_classes: int = 1000, **kwargs) -> VisionTransformer:
     """
     ViT-Base: 原始论文中的基础配置 (ViT-B/16)
     参数量约 86M
+    每头维度: 768/12 = 64
     """
     return VisionTransformer(
         image_size=224, patch_size=16, in_channels=3,
@@ -601,6 +827,7 @@ def vit_large(num_classes: int = 1000, **kwargs) -> VisionTransformer:
     """
     ViT-Large: 大型 ViT (ViT-L/16)
     参数量约 307M
+    每头维度: 1024/16 = 64
     """
     return VisionTransformer(
         image_size=224, patch_size=16, in_channels=3,
@@ -614,7 +841,7 @@ def vit_large(num_classes: int = 1000, **kwargs) -> VisionTransformer:
 
 
 # ============================================================
-# 第七部分：简单演示
+# 第八部分：简单演示
 # ============================================================
 
 if __name__ == "__main__":
@@ -649,17 +876,17 @@ if __name__ == "__main__":
     height = 224        # 图像高度
     width = 224         # 图像宽度
     x = torch.randn(batch_size, channels, height, width).to(device)
-    print(f"\n输入张量形状: {x.shape}  (N={batch_size}, C={channels}, H={height}, W={width})")
+    print(f"\n输入张量形状: {tuple(x.shape)}  (N={batch_size}, C={channels}, H={height}, W={width})")
 
     # ---- 前向传播 ----
     model.eval()  # 切换到评估模式 (Dropout 不生效)
     with torch.no_grad():  # 不计算梯度 (节省内存)
-        logits = model(x)
+        logits, _ = model(x)
 
-    print(f"输出张量形状: {logits.shape}  (N={batch_size}, num_classes=10)")
+    print(f"输出张量形状: {tuple(logits.shape)}  (N={batch_size}, num_classes=10)")
 
     # ---- 计算预测类别 ----
-    # argmax 找到概率最大的类别索引
+    # argmax 找到 logit 最大的类别索引
     predictions = logits.argmax(dim=-1)
     print(f"预测类别:     {predictions.tolist()}")
 
@@ -667,5 +894,22 @@ if __name__ == "__main__":
     num_patches = model.patch_embedding.num_patches
     print(f"\n图像块数量: {num_patches}  (每行 {int(num_patches**0.5)} 个，共 {int(num_patches**0.5)} 行)")
     print(f"Transformer 序列长度 (含 CLS Token): {num_patches + 1}")
+
+    # ---- 演示注意力权重可视化 ----
+    print("\n---- 注意力权重可视化演示 ----")
+    single_img = torch.randn(1, 3, 224, 224).to(device)  # 单张图片
+    # get_attention_map 返回最后一层所有头的注意力矩阵
+    attn_map = model.get_attention_map(single_img, layer_idx=-1)
+    print(f"最后一层注意力权重形状: {tuple(attn_map.shape)}")
+    print(f"  第0头对 CLS Token 的注意力分布 (前5个位置):")
+    print(f"  {attn_map[0, 0, :5].tolist()}")  # 第0头，CLS Token 行，前5列
+
+    # ---- 演示 Mean Pooling 变体 ----
+    print("\n---- Mean Pooling 变体演示 ----")
+    model_mean = vit_tiny(num_classes=10, pool="mean").to(device)
+    model_mean.eval()
+    with torch.no_grad():
+        logits_mean, _ = model_mean(x)
+    print(f"Mean Pooling 输出形状: {tuple(logits_mean.shape)}")
 
     print("\n演示完成！✅")
