@@ -442,9 +442,11 @@ def main():
         pred_zh  = CIFAR10_CLASSES_ZH[pred_idx]
         conf     = probs[i][pred_idx].item()
         correct  = "✅" if pred_idx == sample_labels[i].item() else "❌"
+        true_label = f"{true_cls}({true_zh})"
+        pred_label = f"{pred_cls}({pred_zh})"
         print(
-            f"  {correct} 真实: {true_cls}({true_zh})<18  "
-            f"预测: {pred_cls}({pred_zh})  置信度: {conf:.4f}"
+            f"  {correct} 真实: {true_label:<18} "
+            f"预测: {pred_label:<18} 置信度: {conf:.4f}"
         )
 
     print()
