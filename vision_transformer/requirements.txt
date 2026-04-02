@@ -11,5 +11,14 @@
 # PyTorch 深度学习框架 (核心依赖)
 torch>=2.0.0
 
-# torchvision 提供图像处理工具和预训练模型 (可选，用于数据集加载等)
+# torchvision 提供图像处理工具和 CIFAR-10 数据集加载
 torchvision>=0.15.0
+
+# Pillow: 图像读取库，torchvision 和 inference.py 依赖
+Pillow>=9.0.0
+
+# TensorBoard: 训练曲线可视化 (train.py 依赖)
+tensorboard>=2.13.0
+
+# tqdm: 训练进度条 (可选，但推荐)
+tqdm>=4.65.0
