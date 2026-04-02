@@ -1,0 +1,24 @@
+# Vision Transformer (ViT) Python 依赖
+#
+# 安装方式:
+#   pip install -r requirements.txt
+#
+# 注意: torch 的版本请根据你的 CUDA 版本选择
+#   - 仅 CPU: pip install torch torchvision
+#   - CUDA 12.x: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   - CUDA 11.8: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# PyTorch 深度学习框架 (核心依赖)
+torch>=2.0.0
+
+# torchvision 提供图像处理工具和 CIFAR-10 数据集加载
+torchvision>=0.15.0
+
+# Pillow: 图像读取库，torchvision 和 inference.py 依赖
+Pillow>=9.0.0
+
+# TensorBoard: 训练曲线可视化 (train.py 依赖)
+tensorboard>=2.13.0
+
+# tqdm: 训练进度条 (可选，但推荐)
+tqdm>=4.65.0

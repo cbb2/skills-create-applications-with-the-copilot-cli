@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem@2026.1.14",
+        "."
+      ],
+      "description": "安全地读写项目内的文件。访问范围限制在当前项目目录，防止越权访问。适用于查看 vit.py 源码、读写测试文件、分析实验结果等操作。"
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking@2025.12.18"
+      ],
+      "description": "通过结构化的逐步思考链分解和解决复杂问题。特别适用于：调试深度学习训练问题（梯度分析、维度追踪）、设计新的 Transformer 变体、分步推导注意力机制数学公式等需要多步推理的场景。"
+    },
+    "fetch": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-fetch"
+      ],
+      "description": "获取网络资源，将 HTML 转换为 Markdown 以高效供 LLM 使用。适用于：获取 arXiv 论文内容（如 ViT 原论文 https://arxiv.org/abs/2010.11929）、查阅 PyTorch 官方文档、参考顶级开源实现（huggingface/timm、lucidrains/vit-pytorch 等）。"
+    }
+  }
+}
